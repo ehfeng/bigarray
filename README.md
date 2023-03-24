@@ -3,10 +3,11 @@
 Toy cli for learning rust, rusty_v8 and rocksdb.
 
 ```sh
-echo '{"greeting": "hello"}' | bigarray
-
+bigarray push '{"greeting": "hi"}' '{"greeting": "hello"}'
+bigarray length # 2
 bigarray clear
-bigarray slice 0 1 # {"greeting": "hello"}
+bigarray # {"greeting": "hello"} {"greeting": "hi"}
+bigarray slice 0 1 # {"greeting": "hello"} 
 bigarray reduce "(s, v) => if (v.greeting == 'hello') s + 1 else s" 0 # 1
 ```
 
