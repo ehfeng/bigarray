@@ -31,17 +31,18 @@ fn main() {
             panic!("Invalid number of arguments")
         }
         1 => {
-            for i in 0..n {
-                let key = [&prefix[..], &i.to_be_bytes()[..]].concat();
-                let value = db.get_cf(default_cf, key).unwrap();
-                match value {
-                    Some(value) => {
-                        println!("{}", String::from_utf8(value).unwrap());
-                    }
-                    None => {
-                        println!("Error reading value");
-                    }
+            let mut iterator = db.prefix_iterator_cf(default_cf, prefix);
+            while let Some(i) = iterator.next() {
+                let (y, z) = i.unwrap();
+                let k = y.into_vec();
+                let v = String::from_utf8(z.into_vec()).unwrap();
+                if k == b"len" {
+                    continue;
                 }
+                let (_, b) = k.split_at(prefix.len());
+                let a: [u8; 4] = b.try_into().unwrap();
+                let i = i32::from_be_bytes(a);
+                println!("[{}] {}", i, v);
             }
         }
         2 => match args[1].as_str() {
@@ -90,6 +91,13 @@ fn main() {
                 );
                 db.write(batch).unwrap();
                 drop(db);
+                return;
+            }
+            // for testing the lexographical ordering of keys and iterators
+            "put" => {
+                let i = args[2].parse::<u32>().unwrap();
+                let key = [&prefix[..], &i.to_be_bytes()[..]].concat();
+                db.put_cf(&default_cf, key, &args[3].as_bytes()).unwrap();
                 return;
             }
             "get" => {
