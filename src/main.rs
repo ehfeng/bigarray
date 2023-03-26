@@ -1,6 +1,23 @@
+use rocksdb::merge_operator::MergeOperands;
 use rocksdb::{self, DB};
 use serde_json;
 use std::env;
+
+fn increment_fn(
+    _new_key: &[u8],
+    existing_val: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
+    dbg!(_new_key);
+    let mut n = 0;
+    if let Some(v) = existing_val {
+        n = u32::from_be_bytes(v.try_into().unwrap());
+    }
+    for op in operands {
+        n = n + u32::from_be_bytes(op.try_into().unwrap());
+    }
+    Some(n.to_be_bytes().to_vec())
+}
 
 fn main() {
     let prefix = b"bigarray:";
@@ -9,6 +26,7 @@ fn main() {
     options.create_if_missing(true);
     options.create_missing_column_families(true);
     options.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(prefix.len()));
+    options.set_merge_operator_associative("incr", increment_fn);
     let default_cf_name = "default";
     let db = DB::open_cf(&options, "/tmp/rocksdb", &[default_cf_name]).unwrap();
     let default_cf = db.cf_handle(&default_cf_name).unwrap();
@@ -84,11 +102,7 @@ fn main() {
                         }
                     }
                 }
-                batch.put_cf(
-                    &default_cf,
-                    len_key,
-                    &(n + args.len() as u32 - 2).to_be_bytes(),
-                );
+                batch.merge_cf(default_cf, len_key, &(args.len() as u32 - 2).to_be_bytes());
                 db.write(batch).unwrap();
                 drop(db);
                 return;
