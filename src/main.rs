@@ -1,14 +1,12 @@
-use rocksdb::merge_operator::MergeOperands;
-use rocksdb::{self, DB};
+use rocksdb::{self, merge_operator, DBWithThreadMode, SingleThreaded, DB};
 use serde_json;
 use std::env;
 
 fn increment_fn(
     _new_key: &[u8],
     existing_val: Option<&[u8]>,
-    operands: &MergeOperands,
+    operands: &merge_operator::MergeOperands,
 ) -> Option<Vec<u8>> {
-    // dbg!(&existing_val);
     let mut n = 0;
     if let Some(v) = existing_val {
         n = u32::from_be_bytes(v.try_into().unwrap());
@@ -19,19 +17,62 @@ fn increment_fn(
     Some(n.to_be_bytes().to_vec())
 }
 
-fn main() {
-    let prefix = b"bigarray:";
-    let len_key = b"bigarray:len";
+const PREFIX: &[u8; 9] = b"bigarray:";
+const LEN_KEY: &[u8; 12] = b"bigarray:len";
 
+fn slice(db: DBWithThreadMode<SingleThreaded>, start: u32, stop: Option<u32>) {
+    let n;
+    match db.get(LEN_KEY) {
+        Ok(Some(value)) => {
+            n = u32::from_be_bytes(value.as_slice().try_into().unwrap());
+        }
+        Ok(None) => {
+            n = 0;
+        }
+        Err(error) => {
+            panic!("Error reading value: {}", error);
+        }
+    }
+    let upper_bound;
+    if stop != None && stop.unwrap() < n {
+        upper_bound = stop.unwrap();
+    } else {
+        upper_bound = n;
+    }
+    let start_key = [&PREFIX[..], &start.to_be_bytes()[..]].concat();
+    let mut iterator = db.iterator(rocksdb::IteratorMode::From(
+        &start_key,
+        rocksdb::Direction::Forward,
+    ));
+
+    while let Some(i) = iterator.next() {
+        let (y, z) = i.unwrap();
+        let k = y.into_vec();
+        let v = String::from_utf8(z.into_vec()).unwrap();
+
+        let (_, b) = k.split_at(PREFIX.len());
+        let i;
+        if let Ok(c) = b.try_into() {
+            let a: [u8; 4] = c;
+            i = i32::from_be_bytes(a);
+            if i + 1 > upper_bound as i32 {
+                break;
+            }
+            println!("[{}] {}", i, v);
+        }
+    }
+}
+
+fn main() {
     let args: Vec<String> = env::args().collect();
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
-    opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(prefix.len()));
+    opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(PREFIX.len()));
     opts.set_merge_operator_associative("incr", increment_fn);
     let db = DB::open(&opts, "/tmp/rocksdb").unwrap();
 
     let n;
-    match db.get(len_key) {
+    match db.get(LEN_KEY) {
         Ok(Some(value)) => {
             n = u32::from_be_bytes(value.as_slice().try_into().unwrap());
         }
@@ -47,24 +88,10 @@ fn main() {
             panic!("Invalid number of arguments")
         }
         1 => {
-            let mut iterator = db.prefix_iterator(prefix);
-            while let Some(i) = iterator.next() {
-                let (y, z) = i.unwrap();
-                let k = y.into_vec();
-                let v = String::from_utf8(z.into_vec()).unwrap();
-                if k == len_key {
-                    continue;
-                }
-                let (_, b) = k.split_at(prefix.len());
-                if let Ok(c) = b.try_into() {
-                    let a: [u8; 4] = c;
-                    let i = i32::from_be_bytes(a);
-                    println!("[{}] {}", i, v);
-                }
-            }
+            slice(db, 0, None);
         }
         2 => match args[1].as_str() {
-            "length" => match db.get(len_key) {
+            "length" => match db.get(LEN_KEY) {
                 Ok(Some(value)) => {
                     let n = u32::from_be_bytes(value.as_slice().try_into().unwrap());
                     println!("{}", n);
@@ -79,8 +106,8 @@ fn main() {
 
             "clear" => {
                 let mut batch = rocksdb::WriteBatch::default();
-                let to = [&prefix[..], &[255; 4][..]].concat();
-                batch.delete_range(prefix.to_vec(), to);
+                let to = [&PREFIX[..], &[255; 4][..]].concat();
+                batch.delete_range(PREFIX.to_vec(), to);
                 db.write(batch).unwrap();
             }
             _ => {
@@ -94,7 +121,7 @@ fn main() {
                     match serde_json::from_str::<serde_json::Value>(&args[i]) {
                         Ok(_) => {
                             let j = n + i as u32 - 2;
-                            let key = [&prefix[..], &j.to_be_bytes()[..]].concat();
+                            let key = [&PREFIX[..], &j.to_be_bytes()[..]].concat();
                             batch.put(key, &args[i].as_bytes());
                         }
                         Err(error) => {
@@ -102,7 +129,7 @@ fn main() {
                         }
                     }
                 }
-                batch.merge(len_key, &(args.len() as u32 - 2).to_be_bytes());
+                batch.merge(LEN_KEY, &(args.len() as u32 - 2).to_be_bytes());
                 db.write(batch).unwrap();
                 drop(db);
                 return;
@@ -110,12 +137,12 @@ fn main() {
             // for testing the lexographical ordering of keys and iterators
             "put" => {
                 let i = args[2].parse::<u32>().unwrap();
-                let key = [&prefix[..], &i.to_be_bytes()[..]].concat();
+                let key = [&PREFIX[..], &i.to_be_bytes()[..]].concat();
                 db.put(key, &args[3].as_bytes()).unwrap();
                 return;
             }
             "get" => {
-                let key = [&prefix[..], &args[2].as_bytes()[..]].concat();
+                let key = [&PREFIX[..], &args[2].as_bytes()[..]].concat();
                 let value = db.get(key).unwrap();
                 match value {
                     Some(value) => {
@@ -127,6 +154,18 @@ fn main() {
                 }
                 return;
             }
+            "slice" => {
+                let start = args[2].parse::<u32>().unwrap();
+                if args.len() < 4 {
+                    slice(db, start, None);
+                } else {
+                    let stop = args[3].parse::<u32>().unwrap();
+                    slice(db, start, Some(stop));
+                }
+            }
+            // "reduce" => {
+            //     let platform = v8::new_default_platform(0, false).make_shared();
+            // }
             _ => {
                 println!("Invalid command");
                 return;
