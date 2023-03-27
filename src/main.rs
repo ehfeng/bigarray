@@ -1,4 +1,4 @@
-use rocksdb::{self, merge_operator, DBWithThreadMode, SingleThreaded, DB};
+use rocksdb::{self, merge_operator, DB};
 use serde_json;
 use std::env;
 
@@ -17,62 +17,18 @@ fn increment_fn(
     Some(n.to_be_bytes().to_vec())
 }
 
-const PREFIX: &[u8; 9] = b"bigarray:";
-const LEN_KEY: &[u8; 12] = b"bigarray:len";
-
-fn slice(db: DBWithThreadMode<SingleThreaded>, start: u32, stop: Option<u32>) {
-    let n;
-    match db.get(LEN_KEY) {
-        Ok(Some(value)) => {
-            n = u32::from_be_bytes(value.as_slice().try_into().unwrap());
-        }
-        Ok(None) => {
-            n = 0;
-        }
-        Err(error) => {
-            panic!("Error reading value: {}", error);
-        }
-    }
-    let upper_bound;
-    if stop != None && stop.unwrap() < n {
-        upper_bound = stop.unwrap();
-    } else {
-        upper_bound = n;
-    }
-    let start_key = [&PREFIX[..], &start.to_be_bytes()[..]].concat();
-    let mut iterator = db.iterator(rocksdb::IteratorMode::From(
-        &start_key,
-        rocksdb::Direction::Forward,
-    ));
-
-    while let Some(i) = iterator.next() {
-        let (y, z) = i.unwrap();
-        let k = y.into_vec();
-        let v = String::from_utf8(z.into_vec()).unwrap();
-
-        let (_, b) = k.split_at(PREFIX.len());
-        let i;
-        if let Ok(c) = b.try_into() {
-            let a: [u8; 4] = c;
-            i = i32::from_be_bytes(a);
-            if i + 1 > upper_bound as i32 {
-                break;
-            }
-            println!("[{}] {}", i, v);
-        }
-    }
-}
-
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
-    opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(PREFIX.len()));
+    opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(
+        bigarray::PREFIX.len(),
+    ));
     opts.set_merge_operator_associative("incr", increment_fn);
     let db = DB::open(&opts, "/tmp/rocksdb").unwrap();
 
     let n;
-    match db.get(LEN_KEY) {
+    match db.get(bigarray::LEN_KEY) {
         Ok(Some(value)) => {
             n = u32::from_be_bytes(value.as_slice().try_into().unwrap());
         }
@@ -88,10 +44,10 @@ fn main() {
             panic!("Invalid number of arguments")
         }
         1 => {
-            slice(db, 0, None);
+            bigarray::slice(db, 0, None);
         }
         2 => match args[1].as_str() {
-            "length" => match db.get(LEN_KEY) {
+            "length" => match db.get(bigarray::LEN_KEY) {
                 Ok(Some(value)) => {
                     let n = u32::from_be_bytes(value.as_slice().try_into().unwrap());
                     println!("{}", n);
@@ -106,8 +62,8 @@ fn main() {
 
             "clear" => {
                 let mut batch = rocksdb::WriteBatch::default();
-                let to = [&PREFIX[..], &[255; 4][..]].concat();
-                batch.delete_range(PREFIX.to_vec(), to);
+                let to = [&bigarray::PREFIX[..], &[255; 4][..]].concat();
+                batch.delete_range(bigarray::PREFIX.to_vec(), to);
                 db.write(batch).unwrap();
             }
             _ => {
@@ -121,7 +77,7 @@ fn main() {
                     match serde_json::from_str::<serde_json::Value>(&args[i]) {
                         Ok(_) => {
                             let j = n + i as u32 - 2;
-                            let key = [&PREFIX[..], &j.to_be_bytes()[..]].concat();
+                            let key = [&bigarray::PREFIX[..], &j.to_be_bytes()[..]].concat();
                             batch.put(key, &args[i].as_bytes());
                         }
                         Err(error) => {
@@ -129,7 +85,7 @@ fn main() {
                         }
                     }
                 }
-                batch.merge(LEN_KEY, &(args.len() as u32 - 2).to_be_bytes());
+                batch.merge(bigarray::LEN_KEY, &(args.len() as u32 - 2).to_be_bytes());
                 db.write(batch).unwrap();
                 drop(db);
                 return;
@@ -137,12 +93,12 @@ fn main() {
             // for testing the lexographical ordering of keys and iterators
             "put" => {
                 let i = args[2].parse::<u32>().unwrap();
-                let key = [&PREFIX[..], &i.to_be_bytes()[..]].concat();
+                let key = [&bigarray::PREFIX[..], &i.to_be_bytes()[..]].concat();
                 db.put(key, &args[3].as_bytes()).unwrap();
                 return;
             }
             "get" => {
-                let key = [&PREFIX[..], &args[2].as_bytes()[..]].concat();
+                let key = [&bigarray::PREFIX[..], &args[2].as_bytes()[..]].concat();
                 let value = db.get(key).unwrap();
                 match value {
                     Some(value) => {
@@ -157,10 +113,10 @@ fn main() {
             "slice" => {
                 let start = args[2].parse::<u32>().unwrap();
                 if args.len() < 4 {
-                    slice(db, start, None);
+                    bigarray::slice(db, start, None);
                 } else {
                     let stop = args[3].parse::<u32>().unwrap();
-                    slice(db, start, Some(stop));
+                    bigarray::slice(db, start, Some(stop));
                 }
             }
             // "reduce" => {
