@@ -107,8 +107,13 @@ fn main() {
                 return;
             }
             Cmd::Pop => {
-                let mut batch = rocksdb::WriteBatch::default();
                 let key = [&bigarray::PREFIX[..], &(n - 1).to_be_bytes()[..]].concat();
+                let mut batch = rocksdb::WriteBatch::default();
+                if n == 0 {
+                    return;
+                }
+                let v = db.get(key.clone()).unwrap();
+                println!("{}", String::from_utf8(v.unwrap()).unwrap());
                 batch.delete(key);
                 batch.merge(bigarray::LEN_KEY, &(-1 as i32).to_be_bytes());
                 db.write(batch).unwrap();
