@@ -3,11 +3,11 @@ use rocksdb::{self, DBWithThreadMode, SingleThreaded};
 pub const PREFIX: &[u8; 9] = b"bigarray:";
 pub const LEN_KEY: &[u8; 12] = b"bigarray:len";
 
-pub fn slice(db: DBWithThreadMode<SingleThreaded>, start: u32, stop: Option<u32>) {
+pub fn slice(db: DBWithThreadMode<SingleThreaded>, start: i32, stop: Option<i32>) {
     let n;
     match db.get(LEN_KEY) {
         Ok(Some(value)) => {
-            n = u32::from_be_bytes(value.as_slice().try_into().unwrap());
+            n = i32::from_be_bytes(value.as_slice().try_into().unwrap());
         }
         Ok(None) => {
             n = 0;
@@ -27,7 +27,6 @@ pub fn slice(db: DBWithThreadMode<SingleThreaded>, start: u32, stop: Option<u32>
         &start_key,
         rocksdb::Direction::Forward,
     ));
-    let mut s: &[String];
     while let Some(i) = iterator.next() {
         let (y, z) = i.unwrap();
         let k = y.into_vec();

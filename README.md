@@ -9,6 +9,7 @@ bigarray clear
 bigarray # {"greeting": "hello"} {"greeting": "hi"}
 bigarray slice 0 1 # {"greeting": "hello"} 
 bigarray get x # 2
+bigarray pop # {"greeting": "hello"}
 # javascript
 bigarray reduce "(s, v) => if (v.greeting == 'hello') s + 1 else s" 0 # 1
 bigarray attach x "(s, v) => if (v.greeting == 'hello') s + 1 else s" 0 # 1

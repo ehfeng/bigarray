@@ -9,12 +9,54 @@ fn increment_fn(
 ) -> Option<Vec<u8>> {
     let mut n = 0;
     if let Some(v) = existing_val {
-        n = u32::from_be_bytes(v.try_into().unwrap());
+        n = i32::from_be_bytes(v.try_into().unwrap());
     }
     for op in operands {
-        n = n + u32::from_be_bytes(op.try_into().unwrap());
+        n = n + i32::from_be_bytes(op.try_into().unwrap());
     }
     Some(n.to_be_bytes().to_vec())
+}
+
+enum Cmd {
+    All,
+    Get(i32),
+    Push(Vec<String>),
+    Slice(i32, Option<i32>),
+    Pop,
+    Length,
+    Clear,
+}
+
+fn cmd_from_args(args: Vec<String>) -> Option<Cmd> {
+    if args.len() < 2 {
+        return Some(Cmd::All);
+    }
+    match args[1].as_str() {
+        "push" => Some(Cmd::Push(args[2..].to_vec())),
+        "slice" => {
+            if args.len() < 3 {
+                return None;
+            }
+            let start = args[2].parse::<i32>().unwrap();
+            if args.len() < 4 {
+                Some(Cmd::Slice(start, None))
+            } else {
+                let stop = args[3].parse::<i32>().unwrap();
+                Some(Cmd::Slice(start, Some(stop)))
+            }
+        }
+        "pop" => Some(Cmd::Pop),
+        "length" => Some(Cmd::Length),
+        "clear" => Some(Cmd::Clear),
+        "get" => {
+            if args.len() < 3 {
+                return None;
+            }
+            let i = args[2].parse::<i32>().unwrap();
+            Some(Cmd::Get(i))
+        }
+        _ => None,
+    }
 }
 
 fn main() {
@@ -30,7 +72,7 @@ fn main() {
     let n;
     match db.get(bigarray::LEN_KEY) {
         Ok(Some(value)) => {
-            n = u32::from_be_bytes(value.as_slice().try_into().unwrap());
+            n = i32::from_be_bytes(value.as_slice().try_into().unwrap());
         }
         Ok(None) => {
             n = 0;
@@ -39,17 +81,42 @@ fn main() {
             panic!("Error reading value: {}", error);
         }
     }
-    match args.len() {
-        0 => {
-            panic!("Invalid number of arguments")
-        }
-        1 => {
-            bigarray::slice(db, 0, None);
-        }
-        2 => match args[1].as_str() {
-            "length" => match db.get(bigarray::LEN_KEY) {
+    match cmd_from_args(args) {
+        Some(cmd) => match cmd {
+            Cmd::All => {
+                bigarray::slice(db, 0, None);
+            }
+            Cmd::Push(elements) => {
+                let mut batch = rocksdb::WriteBatch::default();
+                for (i, element) in elements.iter().enumerate() {
+                    match serde_json::from_str::<serde_json::Value>(&element) {
+                        Ok(_) => {
+                            let j = n + i as i32;
+                            let key = [&bigarray::PREFIX[..], &j.to_be_bytes()[..]].concat();
+                            batch.put(key, &element.as_bytes());
+                        }
+                        Err(error) => {
+                            eprintln!("{}", element);
+                            eprintln!("Error parsing json: {}", error);
+                        }
+                    }
+                }
+                batch.merge(bigarray::LEN_KEY, &(elements.len() as i32).to_be_bytes());
+                db.write(batch).unwrap();
+                drop(db);
+                return;
+            }
+            Cmd::Pop => {
+                let mut batch = rocksdb::WriteBatch::default();
+                let key = [&bigarray::PREFIX[..], &(n - 1).to_be_bytes()[..]].concat();
+                batch.delete(key);
+                batch.merge(bigarray::LEN_KEY, &(-1 as i32).to_be_bytes());
+                db.write(batch).unwrap();
+            }
+            Cmd::Slice(start, stop) => bigarray::slice(db, start, stop),
+            Cmd::Length => match db.get(bigarray::LEN_KEY) {
                 Ok(Some(value)) => {
-                    let n = u32::from_be_bytes(value.as_slice().try_into().unwrap());
+                    let n = i32::from_be_bytes(value.as_slice().try_into().unwrap());
                     println!("{}", n);
                 }
                 Ok(None) => {
@@ -59,73 +126,21 @@ fn main() {
                     panic!("Error reading value: {}", error);
                 }
             },
-
-            "clear" => {
+            Cmd::Clear => {
                 let mut batch = rocksdb::WriteBatch::default();
                 let to = [&bigarray::PREFIX[..], &[255; 4][..]].concat();
                 batch.delete_range(bigarray::PREFIX.to_vec(), to);
                 db.write(batch).unwrap();
             }
-            _ => {
-                panic!("Invalid command");
-            }
-        },
-        _ => match args[1].as_str() {
-            "push" => {
-                let mut batch = rocksdb::WriteBatch::default();
-                for i in 2..args.len() {
-                    match serde_json::from_str::<serde_json::Value>(&args[i]) {
-                        Ok(_) => {
-                            let j = n + i as u32 - 2;
-                            let key = [&bigarray::PREFIX[..], &j.to_be_bytes()[..]].concat();
-                            batch.put(key, &args[i].as_bytes());
-                        }
-                        Err(error) => {
-                            println!("Error parsing json: {}", error);
-                        }
-                    }
-                }
-                batch.merge(bigarray::LEN_KEY, &(args.len() as u32 - 2).to_be_bytes());
-                db.write(batch).unwrap();
-                drop(db);
-                return;
-            }
-            // for testing the lexographical ordering of keys and iterators
-            "put" => {
-                let i = args[2].parse::<u32>().unwrap();
+            Cmd::Get(i) => {
                 let key = [&bigarray::PREFIX[..], &i.to_be_bytes()[..]].concat();
-                db.put(key, &args[3].as_bytes()).unwrap();
-                return;
-            }
-            "get" => {
-                let key = [&bigarray::PREFIX[..], &args[2].as_bytes()[..]].concat();
-                let value = db.get(key).unwrap();
-                match value {
-                    Some(value) => {
-                        println!("{}", String::from_utf8(value).unwrap());
-                    }
-                    None => {
-                        println!("key {} not found", args[2]);
-                    }
+                if let Some(value) = db.get(key).unwrap() {
+                    println!("{}", String::from_utf8(value).unwrap())
                 }
-                return;
-            }
-            "slice" => {
-                let start = args[2].parse::<u32>().unwrap();
-                if args.len() < 4 {
-                    bigarray::slice(db, start, None);
-                } else {
-                    let stop = args[3].parse::<u32>().unwrap();
-                    bigarray::slice(db, start, Some(stop));
-                }
-            }
-            // "reduce" => {
-            //     let platform = v8::new_default_platform(0, false).make_shared();
-            // }
-            _ => {
-                println!("Invalid command");
-                return;
             }
         },
+        None => {
+            eprintln!("Usage: bigarray push <json>...")
+        }
     }
 }
