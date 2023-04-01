@@ -1,11 +1,101 @@
 use rocksdb::{self, DBWithThreadMode, SingleThreaded};
+use std::collections::HashMap;
 
-pub const PREFIX: &[u8; 9] = b"bigarray:";
-pub const LEN_KEY: &[u8; 12] = b"bigarray:len";
+pub const AGGREGATE: &[u8; 3] = b"agg"; // iterable
+pub const LENGTH: &[u8; 3] = b"len"; // singular value
+pub const REDUCER: &[u8; 3] = b"red"; // iteratable
+pub const PREFIX: &[u8; 3] = b"val";
 
-pub fn slice(db: DBWithThreadMode<SingleThreaded>, start: i32, stop: Option<i32>) -> Vec<String> {
+pub fn valid_var_name(name: &String) -> bool {
+    let mut is_valid_var = false;
+    {
+        let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
+        let handle_scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Context::new(handle_scope);
+        let scope = &mut v8::ContextScope::new(handle_scope, context);
+        let mut var_name = String::from("var ");
+        var_name.push_str(name.as_str());
+        let var = v8::String::new(scope, var_name.as_str()).unwrap();
+        if let Some(script) = v8::Script::compile(scope, var, None) {
+            if let Some(_) = script.run(scope) {
+                is_valid_var = true;
+            }
+        }
+    }
+    is_valid_var
+}
+
+pub fn push(db: &DBWithThreadMode<SingleThreaded>, elements: Vec<String>, n: i32) -> i32 {
+    let mut batch = rocksdb::WriteBatch::default();
+    for (i, element) in elements.iter().enumerate() {
+        match serde_json::from_str::<serde_json::Value>(&element) {
+            Ok(_) => {
+                let j = n + i as i32;
+                let key = [&PREFIX[..], &j.to_be_bytes()[..]].concat();
+                batch.put(key, &element.as_bytes());
+            }
+            Err(error) => {
+                eprintln!("{}", element);
+                eprintln!("Error parsing json: {}", error);
+            }
+        }
+    }
+    batch.merge(LENGTH, &(elements.len() as i32).to_be_bytes());
+
+    let mut read_opts = rocksdb::ReadOptions::default();
+    read_opts.set_iterate_upper_bound(&PREFIX[..]);
+    let mut iterator = db.iterator_opt(
+        rocksdb::IteratorMode::From(&REDUCER[..], rocksdb::Direction::Forward),
+        read_opts,
+    );
+    while let Some(i) = iterator.next() {
+        let (y, z) = i.unwrap();
+
+        let script = String::from_utf8(z.into_vec()).unwrap();
+
+        let reducer_name = String::from_utf8(y.into_vec()[3..].to_vec()).unwrap();
+        let reducer_key = [&AGGREGATE[..], &reducer_name.clone().into_bytes()].concat();
+        let state = db.get(reducer_key).unwrap().unwrap();
+        let initial_value = String::from_utf8(state).unwrap();
+
+        let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
+        let handle_scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Context::new(handle_scope);
+        let scope = &mut v8::ContextScope::new(handle_scope, context);
+
+        let code = v8::String::new(scope, script.as_str()).unwrap();
+        let code = v8::Script::compile(scope, code, None).unwrap();
+        let function: v8::Local<v8::Function> = code.run(scope).unwrap().try_into().unwrap();
+        let initial_value = v8::String::new(scope, initial_value.as_str()).unwrap();
+        let mut initial_value = v8::json::parse(scope, initial_value).unwrap();
+        let undef: v8::Local<v8::Value> = v8::undefined(scope).into();
+        for (i, elm) in elements.iter().enumerate() {
+            let local_str = v8::String::new(scope, elm.as_str()).unwrap();
+            let value = v8::json::parse(scope, local_str).unwrap();
+            let idx = v8::Integer::new(scope, i as i32).into();
+            let args = [initial_value, value, idx];
+            initial_value = function.call(scope, undef, &args).unwrap();
+        }
+        let state_key = [&AGGREGATE[..], &reducer_name.into_bytes()].concat();
+        let state_value = initial_value.to_rust_string_lossy(scope).into_bytes();
+        batch.put(state_key, state_value);
+    }
+    db.write(batch).unwrap();
+
+    match db.get(LENGTH) {
+        Ok(Some(value)) => {
+            return i32::from_be_bytes(value.as_slice().try_into().unwrap());
+        }
+        Ok(None) => return 0,
+        Err(error) => {
+            panic!("Error reading value: {}", error);
+        }
+    }
+}
+
+pub fn slice(db: &DBWithThreadMode<SingleThreaded>, start: i32, stop: Option<i32>) -> Vec<String> {
     let n;
-    match db.get(LEN_KEY) {
+    match db.get(LENGTH) {
         Ok(Some(value)) => {
             n = i32::from_be_bytes(value.as_slice().try_into().unwrap());
         }
@@ -48,18 +138,10 @@ pub fn slice(db: DBWithThreadMode<SingleThreaded>, start: i32, stop: Option<i32>
 }
 
 pub fn reduce(array: Vec<String>, reducer: String, initial_state: Option<String>) -> String {
-    let platform = v8::new_default_platform(0, false).make_shared();
-    v8::V8::initialize_platform(platform);
-    v8::V8::initialize();
     let aggregator_str;
     {
-        // Create a new Isolate and make it the current one.
         let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
-
-        // Create a stack-allocated handle scope.
         let handle_scope = &mut v8::HandleScope::new(isolate);
-
-        // Create a new context.
         let context = v8::Context::new(handle_scope);
 
         let scope = &mut v8::ContextScope::new(handle_scope, context);
@@ -83,9 +165,71 @@ pub fn reduce(array: Vec<String>, reducer: String, initial_state: Option<String>
         }
         aggregator_str = aggregator.to_rust_string_lossy(scope);
     }
-    unsafe {
-        v8::V8::dispose();
-    }
-    v8::V8::dispose_platform();
     aggregator_str
+}
+
+pub fn reducers(db: &DBWithThreadMode<SingleThreaded>) -> HashMap<String, String> {
+    let mode = rocksdb::IteratorMode::From(&REDUCER[..], rocksdb::Direction::Forward);
+    let mut read_opts = rocksdb::ReadOptions::default();
+    read_opts.set_iterate_upper_bound(&PREFIX[..]);
+    let mut iterator = db.iterator_opt(mode, read_opts);
+    let mut h: HashMap<String, String> = HashMap::new();
+    while let Some(i) = iterator.next() {
+        let (x, y) = i.unwrap();
+        let k = x.into_vec();
+        let reducer_name = String::from_utf8(k).unwrap();
+        let script = String::from_utf8(y.into_vec()).unwrap();
+        h.insert(reducer_name, script);
+    }
+    h
+}
+
+pub fn attach(
+    db: &DBWithThreadMode<SingleThreaded>,
+    name: String,
+    script: String,
+    initial_value: Option<String>,
+) -> bool {
+    let elements = slice(db, 0, None);
+    {
+        let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
+        let handle_scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Context::new(handle_scope);
+        let scope = &mut v8::ContextScope::new(handle_scope, context);
+        let initial_value = v8::String::new(scope, initial_value.unwrap().as_str()).unwrap();
+        let mut initial_value = v8::json::parse(scope, initial_value).unwrap();
+        let code = v8::String::new(scope, script.as_str()).unwrap();
+        if let Some(code) = v8::Script::compile(scope, code, None) {
+            let mut batch = rocksdb::WriteBatch::default();
+            let reducer_key = [&REDUCER[..], &name.clone().into_bytes()].concat();
+            let function: v8::Local<v8::Function> = code.run(scope).unwrap().try_into().unwrap();
+
+            batch.put(reducer_key, script.into_bytes());
+            let undef: v8::Local<v8::Value> = v8::undefined(scope).into();
+
+            for (i, elm) in elements.iter().enumerate() {
+                let local_str = v8::String::new(scope, elm.as_str()).unwrap();
+                let value = v8::json::parse(scope, local_str).unwrap();
+                let idx = v8::Integer::new(scope, i as i32).into();
+                let args = [initial_value, value, idx];
+                initial_value = function.call(scope, undef, &args).unwrap();
+            }
+
+            let state_key = [&AGGREGATE[..], &name.into_bytes()].concat();
+            let state_value = initial_value.to_rust_string_lossy(scope).into_bytes();
+            batch.put(state_key, state_value);
+            db.write(batch).unwrap();
+        }
+    }
+    true
+}
+
+pub fn state(db: DBWithThreadMode<SingleThreaded>, name: String) -> Option<String> {
+    let state_key = [&AGGREGATE[..], &name.into_bytes()].concat();
+    if let Ok(state_value) = db.get(state_key) {
+        if let Some(state_value) = state_value {
+            return Some(String::from_utf8(state_value).unwrap());
+        }
+    }
+    None
 }
